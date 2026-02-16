@@ -28,17 +28,18 @@
 
 ### Backend Stack
 - **Framework**: NestJS (TypeScript)
-- **Database**: PostgreSQL with TypeORM
+- **Database**: MySQL dengan TypeORM
 - **Authentication**: Passport JWT
+- **Real-time**: Socket.IO (WebSocket)
+- **Email**: Nodemailer (SMTP)
 - **Validation**: class-validator, class-transformer
 - **File Upload**: Multer
 
 ### Frontend Stack
 - **Framework**: Next.js 14 (App Router)
-- **UI Library**: shadcn/ui + TailwindCSS
-- **State Management**: Zustand
+- **UI Library**: Joy UI (MUI)
 - **HTTP Client**: Axios
-- **Form Validation**: React Hook Form + Zod
+- **Real-time**: Socket.IO Client
 
 ### Database Schema
 
@@ -99,18 +100,93 @@ notifications
 ## 🛠️ Installation & Setup
 
 ### Prerequisites
-- Node.js 18+ and npm
-- PostgreSQL 14+
-- Git
+- **Node.js** 18+ dan npm ([download](https://nodejs.org/))
+- **MySQL** 5.7+ (bisa pakai [Laragon](https://laragon.org/), XAMPP, atau MySQL standalone)
+- **Git** ([download](https://git-scm.com/))
 
 ### 1. Clone Repository
 
 ```bash
-git clone <repository-url>
-cd Fullstack_TestCase
+git clone https://github.com/WagYu31/Fullstack_TestCas.git
+cd Fullstack_TestCas
 ```
 
-### 2. Backend Setup
+### 2. Setup Database MySQL
+
+Buat database baru di MySQL:
+
+```sql
+CREATE DATABASE dms_db;
+```
+
+Lalu import file SQL untuk membuat akun demo:
+
+```bash
+# Dari folder project
+mysql -u root -p dms_db < backend/FINAL-create-users.sql
+```
+
+Atau buka file `backend/FINAL-create-users.sql` di **phpMyAdmin** / **HeidiSQL** / **MySQL Workbench** dan jalankan.
+
+**Akun demo yang dibuat:**
+
+| Role | Email | Password |
+|------|-------|----------|
+| **Admin** | admin@cybermax.com | admin123 |
+| **User** | user@cybermax.com | admin123 |
+
+> 📝 **Catatan**: Jika ingin reset password semua user, jalankan file `backend/FINAL-reset-password.sql`.
+
+### 3. Konfigurasi Environment (`.env`)
+
+File `.env` sudah disediakan di `backend/.env`. Sesuaikan jika perlu:
+
+```env
+# Database Configuration (MySQL)
+DB_HOST=localhost
+DB_PORT=3306
+DB_USERNAME=root        # sesuaikan dengan user MySQL kamu
+DB_PASSWORD=            # kosong jika pakai Laragon/XAMPP default
+DB_DATABASE=dms_db
+
+# JWT Configuration
+JWT_SECRET=dms-secret-key-2026-fullstack-test-case-super-secure
+JWT_EXPIRES_IN=7d
+
+# Application
+PORT=3001
+NODE_ENV=development
+
+# File Upload
+MAX_FILE_SIZE=104857600   # 100MB
+UPLOAD_DEST=./uploads
+
+# CORS
+FRONTEND_URL=http://localhost:3000
+
+# SMTP Email (opsional, untuk fitur email notification)
+SMTP_HOST=mail.yourdomain.com
+SMTP_PORT=465
+SMTP_USER=noreply@yourdomain.com
+SMTP_PASS=your-email-password
+SMTP_FROM="Cybermax DMS" <noreply@yourdomain.com>
+```
+
+| Variable | Deskripsi | Wajib? |
+|----------|-----------|--------|
+| `DB_HOST` | Host MySQL (biasanya `localhost`) | ✅ Ya |
+| `DB_PORT` | Port MySQL (default `3306`) | ✅ Ya |
+| `DB_USERNAME` | Username MySQL | ✅ Ya |
+| `DB_PASSWORD` | Password MySQL (kosong = tanpa password) | ✅ Ya |
+| `DB_DATABASE` | Nama database (`dms_db`) | ✅ Ya |
+| `JWT_SECRET` | Secret key untuk JWT token | ✅ Ya |
+| `SMTP_HOST` | Host email server | ❌ Opsional |
+| `SMTP_USER` | Email pengirim | ❌ Opsional |
+| `SMTP_PASS` | Password email | ❌ Opsional |
+
+> ⚠️ **SMTP bersifat opsional** — aplikasi tetap berjalan tanpa konfigurasi email. Fitur forgot password dan email notifikasi hanya aktif jika SMTP dikonfigurasi.
+
+### 4. Backend Setup
 
 ```bash
 cd backend
@@ -118,20 +194,15 @@ cd backend
 # Install dependencies
 npm install
 
-# Configure environment variables
-cp .env.example .env
-# Edit .env and set your PostgreSQL credentials
-
-# Create database
-createdb dms_db
-
-# Start backend server
+# Start backend server (development mode)
 npm run start:dev
 ```
 
-Backend will run on `http://localhost:3001`
+Backend akan berjalan di **http://localhost:3001**
 
-### 3. Frontend Setup
+> Tabel database akan otomatis dibuat oleh TypeORM (`synchronize: true`).
+
+### 5. Frontend Setup
 
 ```bash
 cd frontend
@@ -143,15 +214,26 @@ npm install
 npm run dev
 ```
 
-Frontend will run on `http://localhost:3000`
+Frontend akan berjalan di **http://localhost:3000**
 
-### 4. Create Admin User
+### 6. Login ke Aplikasi
 
-Register a user through the UI, then manually update the database:
+Buka **http://localhost:3000/login** dan gunakan akun demo:
 
-```sql
-UPDATE users SET role = 'ADMIN' WHERE email = 'admin@example.com';
-```
+- **Admin**: `admin@cybermax.com` / `admin123`
+- **User**: `user@cybermax.com` / `admin123`
+
+Atau register akun baru di **http://localhost:3000/register** (user pertama otomatis menjadi Admin).
+
+### 📁 Daftar File SQL
+
+| File | Fungsi |
+|------|--------|
+| `backend/FINAL-create-users.sql` | Buat akun Admin + User demo |
+| `backend/FINAL-reset-password.sql` | Reset semua password ke default |
+| `backend/create-new-users.sql` | Script alternatif buat user |
+| `backend/recreate-users.sql` | Hapus dan buat ulang semua user |
+| `backend/reset-passwords.sql` | Script alternatif reset password |
 
 ---
 
