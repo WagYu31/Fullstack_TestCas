@@ -1,0 +1,5 @@
+export enum DocumentStatus {
+    ACTIVE = 'ACTIVE',
+    PENDING_DELETE = 'PENDING_DELETE',
+    PENDING_REPLACE = 'PENDING_REPLACE',
+}
