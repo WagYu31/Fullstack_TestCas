@@ -402,105 +402,320 @@ Authorization: Bearer <token>
 
 ### 1. How to handle large file uploads?
 
-**Implementation:**
-- **Chunked Upload**: Frontend slices files into 5MB chunks
-- **Streaming**: Multer streams directly to disk (no memory buffering)
-- **Progress Tracking**: Real-time upload progress via WebSocket
-- **Resumable**: Using `tus` protocol for interrupted uploads
-- **Limits**: Max 100MB per file, configurable in `.env`
-- **Storage**: Local filesystem for development, S3/MinIO for production
+**Strategi yang Diimplementasikan:**
 
-**Code Example:**
+Sistem menggunakan **Multer** dengan **disk storage** untuk menangani upload file besar secara efisien — file di-stream langsung ke disk tanpa buffering ke memory, sehingga server tidak kehabisan RAM meskipun file berukuran besar.
+
+**Current Implementation:**
+
 ```typescript
-// Backend - multer configuration
-FileInterceptor('file', {
+// documents.controller.ts — Multer disk storage configuration
+@UseInterceptors(FileInterceptor('file', {
   storage: diskStorage({
     destination: './uploads',
     filename: (req, file, cb) => {
+      // UUID-based filename mencegah collision dan path traversal
       const uniqueName = `${uuidv4()}${extname(file.originalname)}`;
       cb(null, uniqueName);
     },
   }),
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
-})
+  limits: { fileSize: 100 * 1024 * 1024 }, // Max 100MB, configurable via .env
+  fileFilter: (req, file, cb) => {
+    // Validasi MIME type untuk keamanan
+    cb(null, true);
+  },
+}))
 ```
+
+**Kenapa Pendekatan Ini?**
+| Aspek | Penjelasan |
+|-------|------------|
+| **Disk Streaming** | Multer stream langsung ke disk → memory usage konstan ~50MB terlepas ukuran file |
+| **UUID Filename** | Mencegah filename collision dan path traversal attack |
+| **Size Limit** | `MAX_FILE_SIZE` di `.env` → mudah di-adjust tanpa ubah code |
+| **Error Handling** | Multer otomatis reject file yang melebihi limit sebelum upload selesai |
+
+**Future Scalability:**
+- **Phase 1**: Pindah ke **S3/MinIO** dengan pre-signed URLs → upload langsung ke storage tanpa lewat server
+- **Phase 2**: **Chunked Upload** menggunakan `tus` protocol untuk upload yang bisa di-resume jika koneksi terputus
+- **Phase 3**: **CDN** (CloudFront) untuk distribusi file yang sudah di-upload
+
+---
 
 ### 2. How to avoid lost updates when replacing documents?
 
-**Implementation:**
-- **Optimistic Locking**: `@VersionColumn()` in Document entity
-- **Status-Based Locking**: Documents in `PENDING_*` status reject concurrent requests
-- **Transaction Safety**: TypeORM transactions for atomic operations
-- **Ownership Check**: Only document owner can request changes
+**Strategi yang Diimplementasikan:**
 
-**Code Example:**
+Sistem menggunakan **3 layer perlindungan** terhadap lost updates:
+
+**Layer 1 — Optimistic Locking (`@VersionColumn`)**
 ```typescript
-// Document entity with version control
+// document.entity.ts
 @VersionColumn()
 version: number;
-
-// Check before allowing replace/delete
-if (document.status !== DocumentStatus.ACTIVE) {
-  throw new BadRequestException('Document already has a pending request');
-}
+// TypeORM otomatis increment version setiap update
+// Jika 2 user update bersamaan, yang kedua akan mendapat error
 ```
+
+**Layer 2 — Status-Based Locking**
+```typescript
+// documents.service.ts — checkOwnership()
+if (document.status !== DocumentStatus.ACTIVE) {
+  throw new BadRequestException(
+    'Document already has a pending request'
+  );
+}
+// Document dengan status PENDING_REPLACE atau PENDING_DELETE
+// tidak bisa di-replace/delete lagi sampai admin approve/reject
+```
+
+**Layer 3 — Permission Workflow**
+```
+User Request Replace → Status: PENDING_REPLACE → Admin Review
+                                    ↓                    ↓
+                              Locked (no other     APPROVED → Replace file
+                              requests allowed)    REJECTED → Back to ACTIVE
+```
+
+**Kenapa 3 Layer?**
+| Layer | Melindungi Dari |
+|-------|----------------|
+| **Optimistic Locking** | 2 user mengedit metadata dokumen yang sama secara bersamaan |
+| **Status Locking** | User mengirim request replace/delete saat sudah ada request pending |
+| **Permission Workflow** | Perubahan tanpa persetujuan admin — semua replace/delete harus di-review |
+
+---
 
 ### 3. How to design notification system for scalability?
 
-**Current Implementation:**
-- PostgreSQL storage with indexed queries
-- Efficient pagination (limit 20 per page)
-- Indexed fields: `userId`, `isRead`, `createdAt`
+**Strategi yang Diimplementasikan:**
+
+Sistem notifikasi didesain dengan **3 channel delivery** yang saling melengkapi:
+
+**Channel 1 — Database Persistent Storage (MySQL)**
+```typescript
+// notification.entity.ts
+@Entity('notifications')
+export class Notification {
+  @Column()           userId: string;      // Indexed → fast query per user
+  @Column()           title: string;
+  @Column('text')     message: string;
+  @Column()           type: NotificationType;
+  @Column()           isRead: boolean;     // Indexed → unread count query
+  @CreateDateColumn() createdAt: Date;     // Indexed → sorted listing
+}
+
+// Pagination: GET /notifications?page=1&limit=20
+// Unread count: GET /notifications/unread-count → { count: 5 }
+```
+
+**Channel 2 — Real-time WebSocket (Socket.IO)**
+```typescript
+// notifications.gateway.ts
+@WebSocketGateway({ namespace: '/notifications' })
+export class NotificationsGateway {
+  private connectedUsers = new Map<string, string[]>();
+
+  handleConnection(client: Socket) {
+    // JWT verification pada koneksi
+    const payload = this.jwtService.verify(token);
+    client.join(`user:${payload.sub}`);       // Room per user
+    if (payload.role === 'ADMIN') {
+      client.join('admins');                  // Room khusus admin
+    }
+  }
+
+  sendToUser(userId, notification) {
+    this.server.to(`user:${userId}`).emit('new-notification', notification);
+  }
+
+  sendToAdmins(notification) {
+    this.server.to('admins').emit('new-notification', notification);
+  }
+}
+```
+
+**Channel 3 — Email Notification (Nodemailer SMTP)**
+```typescript
+// mail.service.ts — 4 jenis email
+sendWelcomeEmail(email, name);           // Saat user register
+sendForgotPasswordEmail(email, token);   // Reset password
+sendPermissionRequestEmail(adminEmail);  // Request baru → admin
+sendPermissionStatusEmail(userEmail);    // Approve/reject → user
+```
+
+**Event-Driven Architecture:**
+```
+User Action → EventEmitter → Event Listener → {
+  1. Save to database (persistent)
+  2. Push via WebSocket (real-time)
+  3. Send email (async, non-blocking)
+}
+```
 
 **Scalability Path:**
-- **Phase 1** (Current): Database-based with polling
-- **Phase 2**: Redis Pub/Sub for real-time delivery
-- **Phase 3**: WebSocket server (Socket.IO) for push notifications
-- **Phase 4**: Separate microservice with message queue (RabbitMQ)
-- **Phase 5**: Database partitioning and archival (>90 days)
+| Phase | Teknologi | Benefit |
+|-------|-----------|---------|
+| **Phase 1** (Current) | MySQL + Socket.IO + Nodemailer | Simple, reliable |
+| **Phase 2** | + Redis Adapter | Multi-instance Socket.IO support |
+| **Phase 3** | + Message Queue (RabbitMQ/Bull) | Email queue, retry mechanism |
+| **Phase 4** | Separate Notification Microservice | Independent scaling |
+| **Phase 5** | Database partitioning | Archive old notifications (>90 hari) |
+
+---
 
 ### 4. How to secure file access?
 
-**Implementation:**
-- **Authentication**: JWT required for all file operations
-- **Authorization**: Ownership check - only owner or ADMIN can access
-- **Secure Storage**: Files stored outside public directory
-- **Download Endpoint**: Authenticated endpoint serves files
-- **File Validation**: MIME type and size validation on upload
-- **Path Sanitization**: UUID-based filenames prevent path traversal
+**Strategi yang Diimplementasikan:**
+
+File dilindungi dengan **5 layer keamanan**:
+
+```
+REQUEST → [1. JWT Auth] → [2. Role Check] → [3. Ownership Check] → [4. Status Check] → [5. Serve File]
+```
+
+**Layer 1 — JWT Authentication**
+```typescript
+// Semua endpoint dokumen dilindungi JwtAuthGuard
+@Controller('documents')
+@UseGuards(JwtAuthGuard)
+export class DocumentsController { ... }
+// Tanpa JWT token yang valid → 401 Unauthorized
+```
+
+**Layer 2 — Role-Based Access Control (RBAC)**
+```typescript
+// Admin bisa akses semua dokumen, User hanya milik sendiri
+if (userRole !== UserRole.ADMIN && document.createdById !== userId) {
+  throw new ForbiddenException('Not authorized');
+}
+```
+
+**Layer 3 — Secure File Storage**
+```
+uploads/                          ← Di luar public directory
+├── 550e8400-e29b-41d4-a716...pdf  ← UUID filename (no original name)
+├── 6ba7b810-9dad-11d1-80b4...docx
+└── ...
+```
+- File disimpan **di luar public directory** → tidak bisa diakses langsung via URL
+- Filename menggunakan **UUID** → mencegah path traversal dan information leakage
+- Original filename disimpan di database, bukan di filesystem
+
+**Layer 4 — Authenticated Download Endpoint**
+```typescript
+// documents.controller.ts
+@Get(':id/download')
+@UseGuards(JwtAuthGuard)
+async download(@Param('id') id, @CurrentUser() user, @Res() res) {
+  // Cek ownership → baru serve file
+  const document = await this.documentsService.findOne(id, user.id, user.role);
+  res.download(document.fileUrl, document.fileName);
+}
+```
+
+**Layer 5 — File Validation on Upload**
+```typescript
+// Validasi sebelum file disimpan:
+// ✅ MIME type check (fileFilter)
+// ✅ File size limit (100MB configurable)
+// ✅ Extension validation
+```
 
 **Future Enhancements:**
-- Signed URLs with expiration (15 minutes)
-- S3 pre-signed URLs for production
-- File encryption at rest
-- Malware scanning (ClamAV)
+- **Signed URLs** dengan expiration (15 menit) untuk S3
+- **File encryption at rest** (AES-256)
+- **Malware scanning** menggunakan ClamAV sebelum file disimpan
+- **Content-Disposition** header untuk mencegah browser execution
+
+---
 
 ### 5. How to structure services for microservice migration?
 
-**Current Structure:**
+**Strategi yang Diimplementasikan:**
+
+Aplikasi didesain dengan **modular monolith architecture** — setiap fitur adalah NestJS module yang independen, siap dipecah menjadi microservice kapan saja.
+
+**Current Modular Structure:**
 ```
 src/
-├── auth/          → Future: Auth Service
-├── users/         → Future: User Service  
-├── documents/     → Future: Document Service
-├── permissions/   → Future: Permission Service
-├── notifications/ → Future: Notification Service
-└── common/        → Shared library
+├── auth/                  → Future: Auth Service
+│   ├── auth.module.ts
+│   ├── auth.service.ts
+│   ├── auth.controller.ts
+│   ├── guards/            ← JWT guards (reusable)
+│   ├── decorators/        ← Custom decorators
+│   └── dto/               ← Validation DTOs
+│
+├── users/                 → Future: User Service
+│   ├── users.module.ts
+│   ├── users.service.ts
+│   └── entities/
+│
+├── documents/             → Future: Document Service
+│   ├── documents.module.ts
+│   ├── documents.service.ts
+│   ├── documents.controller.ts
+│   └── entities/
+│
+├── permission-requests/   → Future: Permission Service
+│   ├── permission-requests.module.ts
+│   ├── permission-requests.service.ts
+│   └── entities/
+│
+├── notifications/         → Future: Notification Service
+│   ├── notifications.module.ts
+│   ├── notifications.service.ts
+│   ├── notifications.gateway.ts  ← WebSocket
+│   ├── listeners/         ← Event-driven handlers
+│   └── entities/
+│
+├── mail/                  → Future: Email Service
+│   ├── mail.module.ts     ← @Global() module
+│   └── mail.service.ts
+│
+└── common/                → Shared Library
+    ├── enums/             ← Shared enums
+    ├── events/            ← Event definitions
+    └── health/            ← Health check endpoint
 ```
 
-**Migration Principles:**
-1. **Bounded Contexts**: Each module owns its data
-2. **No Direct DB Access**: Services communicate via APIs/events
-3. **Event-Driven**: Event emitters now → Message queue later
-4. **API Versioning**: All endpoints versioned (`/api/v1/...`)
-5. **Database Per Service**: Each module has separate entities
-6. **Shared Libraries**: Common code extracted to npm packages
+**Design Principles yang Sudah Diterapkan:**
 
-**Migration Order:**
-1. Extract Notification Service (least coupled)
-2. Extract Document Service (with file storage)
-3. Extract Permission Service
-4. Extract Auth Service (most critical, do last)
+| Principle | Implementation | Benefit |
+|-----------|---------------|---------|
+| **Bounded Context** | Setiap module punya entity, service, controller sendiri | Module bisa di-extract tanpa ubah module lain |
+| **Event-Driven** | `EventEmitterModule` untuk komunikasi antar module | Ganti ke RabbitMQ/Kafka tanpa ubah business logic |
+| **Dependency Injection** | NestJS DI container mengelola semua dependencies | Mudah swap implementation (mock untuk testing) |
+| **Global Modules** | `MailModule` sebagai `@Global()` | Shared service tersedia di semua module |
+| **DTO Validation** | `class-validator` di setiap endpoint | Contract yang jelas antar service |
+
+**Migration Path:**
+
+```
+Phase 1 (Current)           Phase 2                    Phase 3
+┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│  Modular Monolith│    │  Hybrid Approach │    │  Full Microservice│
+│                  │    │                  │    │                  │
+│  ┌────┐ ┌────┐  │    │  ┌────────────┐  │    │  ┌────┐  ┌────┐ │
+│  │Auth│ │User│  │    │  │ Monolith   │  │    │  │Auth│  │User│ │
+│  └────┘ └────┘  │    │  │(Auth+User) │  │    │  │Svc │  │Svc │ │
+│  ┌────┐ ┌────┐  │    │  └────────────┘  │    │  └──┬─┘  └──┬─┘ │
+│  │Doc │ │Perm│  │    │        ↕ API     │    │     ↕ MQ    ↕   │
+│  └────┘ └────┘  │    │  ┌────────────┐  │    │  ┌────┐  ┌────┐ │
+│  ┌────┐ ┌────┐  │    │  │Notification│  │    │  │Doc │  │Notif│ │
+│  │Noti│ │Mail│  │    │  │ Service    │  │    │  │Svc │  │Svc │ │
+│  └────┘ └────┘  │    │  └────────────┘  │    │  └────┘  └────┘ │
+└──────────────────┘    └──────────────────┘    └──────────────────┘
+    1 Deployment             2 Deployments          5+ Deployments
+```
+
+**Recommended Migration Order:**
+1. **Notification Service** (paling loosely coupled, hanya terima events)
+2. **Mail Service** (stateless, mudah di-scale horizontal)
+3. **Document Service** (termasuk file storage → S3)
+4. **Permission Service** (bergantung pada Document + User)
+5. **Auth Service** (paling critical, migrasi terakhir)
 
 ---
 
